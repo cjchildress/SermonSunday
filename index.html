@@ -179,7 +179,7 @@ textarea {
       <button id="usePaste" class="primary">Use pasted text</button>
       <button id="closeLoad">Cancel</button>
     </div>
-    <p class="hint">From Claude Docs, export as Word or Markdown. Section headings show as labels and are skipped while listening. Tap any word to jump there if the prompter loses its place.</p>
+    <p class="hint">From Claude Docs, export as Word or Markdown. Section headings show as labels and are skipped while listening. Voice tracking requires four consecutive matching words and never moves backward automatically. Tap any word to reposition manually.</p>
     <ul class="keys">
       <li>Space: start or stop listening</li>
       <li>Arrow keys, Page Up/Down or a page-turner pedal: previous or next sentence</li>
@@ -206,7 +206,7 @@ textarea {
     get(k, d) { try { const v = localStorage.getItem(k); return v == null ? d : JSON.parse(v); } catch (e) { return d; } },
     set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} }
   };
-  const settings = Object.assign({ size: innerWidth < 700 ? 26 : 38, theme: 'dark', heard: false }, store.get('pp.settings', {}));
+  const settings = Object.assign({ size: innerWidth < 700 ? 26 : 38, theme: 'dark', heard: false }, store.get('sermonsunday.settings', {}));
   function applySettings() {
     document.documentElement.dataset.theme = settings.theme;
     document.documentElement.style.setProperty('--size', settings.size + 'px');
@@ -214,7 +214,7 @@ textarea {
     heardEl.hidden = !settings.heard;
     heardBtn.setAttribute('aria-pressed', String(settings.heard));
     heardBtn.textContent = settings.heard ? 'Hide heard' : 'Show heard';
-    store.set('pp.settings', settings);
+    store.set('sermonsunday.settings', settings);
   }
 
   let toastT;
@@ -391,7 +391,7 @@ textarea {
       curS = s;
     }
     curW = w; pos = e;
-    clearTimeout(saveT); saveT = setTimeout(() => store.set('pp.pos', pos), 800);
+    clearTimeout(saveT); saveT = setTimeout(() => store.set('sermonsunday.pos', pos), 800);
     updateStats();
     follow(jump);
   }
@@ -448,60 +448,42 @@ textarea {
     if (sp) jumpToWord(+sp.dataset.i);
   });
 
-  // ---------- matching speech to the script ----------
-  function wlcs(h, s, e) {
-    const n = e - s + 1;
-    let prev = new Float32Array(n + 1), cur = new Float32Array(n + 1);
-    for (let i = 1; i <= h.length; i++) {
-      cur[0] = 0;
-      const hw = h[i - 1];
-      for (let j = 1; j <= n; j++) {
-        const m = M[s + j - 1];
-        let v = prev[j] > cur[j - 1] ? prev[j] : cur[j - 1];
-        if (eq(hw, m.n)) { const d = prev[j - 1] + (m.stop ? 0.4 : 1); if (d > v) v = d; }
-        cur[j] = v;
-      }
-      const t = prev; prev = cur; cur = t;
-    }
-    return prev[n];
-  }
-  function search(h, lo, hi, local) {
-    const K = h.length, L = K + 4;
-    let best = null, bestVal = -1e9;
-    for (let e = lo; e <= hi; e++) {
-      const score = wlcs(h, Math.max(0, e - L + 1), e);
-      const d = e - pos;
-      let need, pen;
-      if (!local) { need = 5; pen = 0; }
-      else if (d >= -2 && d <= 25) { need = 1.8; pen = 0; }
-      else if (d > 25) { need = 3.2; pen = Math.min(1.5, (d - 25) / 60); }
-      else { need = 4.2; pen = Math.min(2.5, 0.8 - d / 40); }
-      if (score < need) continue;
-      const val = score - pen + (eq(h[K - 1], M[e].n) ? 0.6 : 0);
-      if (val > bestVal + 1e-6 || (Math.abs(val - bestVal) <= 1e-6 && Math.abs(d) < Math.abs(best.e - pos))) {
-        bestVal = val; best = { e, score };
-      }
-    }
-    return best;
-  }
-  let lastKey = '', lastGlobal = 0;
+  // ---------- cautious, forward-only sermon following ----------
+  // Speech recognition may revise interim results. Require four consecutive
+  // words in manuscript order before moving; ad-libs simply leave us in place.
+  const MIN_MATCH_WORDS = 4;
+  const MAX_FORWARD_WORDS = 22;
+  let lastKey = '';
   function locate() {
+    if (!M.length) return;
     const tail = getTail();
     const key = tail.join(' ');
     if (key === lastKey) return;
     lastKey = key;
-    if (tail.length < 2 || !M.length) return;
-    const r = search(tail, Math.max(0, pos - 40), Math.min(M.length - 1, pos + 150), true);
-    if (r) {
-      if (r.e < pos && pos - r.e <= 3) return;
-      if (r.e !== pos) setPos(r.e, false);
-      return;
+    if (tail.length < MIN_MATCH_WORDS) return;
+
+    // Include the current position as an anchor, but never move to it or behind it.
+    // No whole-document fallback: repeated phrases later in the sermon are ignored.
+    const lo = Math.max(0, pos);
+    const hi = Math.min(M.length - 1, pos + MAX_FORWARD_WORDS);
+    let best = -1, bestLength = 0;
+    for (let end = Math.max(0, lo); end <= hi; end++) {
+      let matched = 0;
+      let heard = tail.length - 1;
+      let script = end;
+      while (heard >= 0 && script >= 0 && eq(tail[heard], M[script].n)) {
+        matched++;
+        heard--;
+        script--;
+      }
+      if (matched < MIN_MATCH_WORDS || end <= pos) continue;
+      // Prefer the closest plausible match, not a distant repeated phrase.
+      if (best < 0 || end < best || (end === best && matched > bestLength)) {
+        best = end;
+        bestLength = matched;
+      }
     }
-    if (tail.length >= 7 && performance.now() - lastGlobal > 1500) {
-      lastGlobal = performance.now();
-      const g = search(tail, 0, M.length - 1, false);
-      if (g) setPos(g.e, false);
-    }
+    if (best > pos) setPos(best, false);
   }
   let pending = false;
   function schedule() {
@@ -636,8 +618,8 @@ textarea {
     const t = (blocks.find(b => b.t === 'h1') || {}).text || fallbackTitle || 'Sermon';
     docTitle.textContent = t;
     stopClock(); startW = 0; resetHeard(); updateStats();
-    store.set('pp.sermon', { blocks, title: t });
-    store.set('pp.pos', -1);
+    store.set('sermonsunday.sermon', { blocks, title: t });
+    store.set('sermonsunday.pos', -1);
     closeLoader();
     if (!quiet) toast('Loaded “' + t + '”: ' + words.length + ' words, about ' + Math.max(1, Math.round(words.length / DEFAULT_WPM)) + ' minutes.');
   }
@@ -677,7 +659,7 @@ textarea {
   $('#topBtn').addEventListener('click', () => {
     if (listening) pauseListening();
     clearMarks(); resetHeard(); stopClock(); startW = 0; updateStats();
-    store.set('pp.pos', -1);
+    store.set('sermonsunday.pos', -1);
     scroller.scrollTo({ top: 0, behavior: reduceMotion ? 'auto' : 'smooth' });
   });
   function resize(delta) {
@@ -714,11 +696,11 @@ textarea {
   // ---------- start ----------
   applySettings();
   setMicUI();
-  const saved = store.get('pp.sermon', null);
+  const saved = store.get('sermonsunday.sermon', null);
   if (saved && Array.isArray(saved.blocks) && saved.blocks.length) {
     build(saved.blocks);
     docTitle.textContent = saved.title || 'Sermon';
-    const p = store.get('pp.pos', -1);
+    const p = store.get('sermonsunday.pos', -1);
     if (p >= 0 && p < M.length) requestAnimationFrame(() => setPos(p, true));
   } else {
     showEmpty();
